@@ -23,6 +23,7 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
+import org.camunda.bpm.engine.ProcessEngine;
 import org.camunda.bpm.engine.ManagementService;
 import org.camunda.bpm.engine.impl.cfg.ProcessEngineConfigurationImpl;
 import org.camunda.bpm.engine.impl.interceptor.Command;
@@ -72,7 +73,7 @@ public class CatalystBridge implements JavaDelegate {
     private static volatile boolean odometerInitialized = false;
     private static final String ODOMETER_MILEAGE_KEY = "catalyst.odometer.mileage";
     private static final String ODOMETER_CREATED_KEY = "catalyst.odometer.created";
-    private static final int ODOMETER_PERSIST_INTERVAL = 1000;
+    private static final int ODOMETER_PERSIST_INTERVAL = 5;
 
     // Security: Webhook URL allowlist configuration
     private static final String WEBHOOK_ALLOWLIST_ENV = "CATALYST_WEBHOOK_ALLOWLIST";
@@ -698,7 +699,7 @@ public class CatalystBridge implements JavaDelegate {
             }
 
             ProcessEngineConfigurationImpl config = (ProcessEngineConfigurationImpl)
-                execution.getProcessEngineServices().getProcessEngineConfiguration();
+                ((ProcessEngine) execution.getProcessEngineServices()).getProcessEngineConfiguration();
 
             final String mileageValue = String.valueOf(currentMileage);
             final String createdValue = odometerCreated;
@@ -706,33 +707,25 @@ public class CatalystBridge implements JavaDelegate {
             config.getCommandExecutorTxRequired().execute(new Command<Void>() {
                 @Override
                 public Void execute(CommandContext commandContext) {
-                    // Delete existing entries (ignore if not present)
-                    try {
-                        PropertyEntity existing = commandContext.getPropertyManager()
-                            .findPropertyById(ODOMETER_MILEAGE_KEY);
-                        if (existing != null) {
-                            commandContext.getDbEntityManager().delete(existing);
-                        }
-                    } catch (Exception e) {
-                        // Ignore — may not exist yet
+                    // Update mileage (update existing or insert new)
+                    PropertyEntity mileageProp = commandContext.getPropertyManager()
+                        .findPropertyById(ODOMETER_MILEAGE_KEY);
+                    if (mileageProp != null) {
+                        mileageProp.setValue(mileageValue);
+                    } else {
+                        commandContext.getDbEntityManager().insert(
+                            new PropertyEntity(ODOMETER_MILEAGE_KEY, mileageValue));
                     }
 
-                    try {
-                        PropertyEntity existing = commandContext.getPropertyManager()
-                            .findPropertyById(ODOMETER_CREATED_KEY);
-                        if (existing != null) {
-                            commandContext.getDbEntityManager().delete(existing);
-                        }
-                    } catch (Exception e) {
-                        // Ignore — may not exist yet
+                    // Update created date (update existing or insert new)
+                    PropertyEntity createdProp = commandContext.getPropertyManager()
+                        .findPropertyById(ODOMETER_CREATED_KEY);
+                    if (createdProp != null) {
+                        createdProp.setValue(createdValue);
+                    } else {
+                        commandContext.getDbEntityManager().insert(
+                            new PropertyEntity(ODOMETER_CREATED_KEY, createdValue));
                     }
-
-                    // Insert fresh entries
-                    PropertyEntity mileageProp = new PropertyEntity(ODOMETER_MILEAGE_KEY, mileageValue);
-                    commandContext.getDbEntityManager().insert(mileageProp);
-
-                    PropertyEntity createdProp = new PropertyEntity(ODOMETER_CREATED_KEY, createdValue);
-                    commandContext.getDbEntityManager().insert(createdProp);
 
                     return null;
                 }
@@ -748,10 +741,15 @@ public class CatalystBridge implements JavaDelegate {
      */
     private void logOdometer(long mileage) {
         String formattedMileage = String.format("%,d", mileage);
-        LOGGER.info("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501");
-        LOGGER.info("\uD83D\uDE97 Catalyst Odometer");
-        LOGGER.info("   Created: {}", odometerCreated);
-        LOGGER.info("   Mileage: {}", formattedMileage);
-        LOGGER.info("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501");
+
+        String odometerBanner = "\n" +
+            "+--------------------------------------------------------------------------+\n" +
+            "| CATALYST ODOMETER                                                        |\n" +
+            "+--------------------------------------------------------------------------+\n" +
+            "| Created: " + formatBannerLine(odometerCreated != null ? odometerCreated : "N/A", 63) + "|\n" +
+            "| Mileage: " + formatBannerLine(formattedMileage, 63) + "|\n" +
+            "+--------------------------------------------------------------------------+";
+
+        LOGGER.info(odometerBanner);
     }
 }
