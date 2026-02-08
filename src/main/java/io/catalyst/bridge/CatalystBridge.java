@@ -16,10 +16,18 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+
+import org.camunda.bpm.engine.ManagementService;
+import org.camunda.bpm.engine.impl.cfg.ProcessEngineConfigurationImpl;
+import org.camunda.bpm.engine.impl.interceptor.Command;
+import org.camunda.bpm.engine.impl.interceptor.CommandContext;
+import org.camunda.bpm.engine.impl.persistence.entity.PropertyEntity;
 
 /**
  * Camunda 7 JavaDelegate for making HTTP POST requests to N8N webhook URLs.
@@ -57,6 +65,14 @@ public class CatalystBridge implements JavaDelegate {
 
     private static final int DEFAULT_TIMEOUT_SECONDS = 30;
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+
+    // Odometer: silent execution counter persisted to ACT_GE_PROPERTY
+    private static final AtomicLong odometerCounter = new AtomicLong(0);
+    private static volatile String odometerCreated = null;
+    private static volatile boolean odometerInitialized = false;
+    private static final String ODOMETER_MILEAGE_KEY = "catalyst.odometer.mileage";
+    private static final String ODOMETER_CREATED_KEY = "catalyst.odometer.created";
+    private static final int ODOMETER_PERSIST_INTERVAL = 1000;
 
     // Security: Webhook URL allowlist configuration
     private static final String WEBHOOK_ALLOWLIST_ENV = "CATALYST_WEBHOOK_ALLOWLIST";
@@ -129,6 +145,9 @@ public class CatalystBridge implements JavaDelegate {
 
     @Override
     public void execute(DelegateExecution execution) throws Exception {
+        // Odometer tick
+        tickOdometer(execution);
+
         // Print banner at start of execution
         printExecutionBanner(execution);
 
@@ -606,5 +625,133 @@ public class CatalystBridge implements JavaDelegate {
         } else {
             return node.asText();
         }
+    }
+
+    // ========================================================================
+    // Odometer — silent execution counter for usage-based self-reporting
+    // ========================================================================
+
+    /**
+     * Increments the odometer counter. Persists and logs every 1,000 executions.
+     * Designed to never throw — all errors are swallowed with a warning log.
+     */
+    private void tickOdometer(DelegateExecution execution) {
+        try {
+            // Lazy initialization: restore from DB on first call
+            if (!odometerInitialized) {
+                synchronized (CatalystBridge.class) {
+                    if (!odometerInitialized) {
+                        restoreOdometer(execution);
+                        odometerInitialized = true;
+                    }
+                }
+            }
+
+            long current = odometerCounter.incrementAndGet();
+
+            if (current % ODOMETER_PERSIST_INTERVAL == 0) {
+                synchronized (CatalystBridge.class) {
+                    persistOdometer(execution, current);
+                    logOdometer(current);
+                }
+            }
+        } catch (Exception e) {
+            // Odometer must NEVER cause a failed execution
+            LOGGER.warn("Odometer tick failed (non-fatal): {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Restores odometer state from ACT_GE_PROPERTY on first execution.
+     * If not found or fails, starts from zero.
+     */
+    private void restoreOdometer(DelegateExecution execution) {
+        try {
+            ManagementService managementService = execution.getProcessEngineServices().getManagementService();
+            Map<String, String> properties = managementService.getProperties();
+
+            String mileage = properties.get(ODOMETER_MILEAGE_KEY);
+            String created = properties.get(ODOMETER_CREATED_KEY);
+
+            if (mileage != null) {
+                long restored = Long.parseLong(mileage);
+                odometerCounter.set(restored);
+                odometerCreated = created;
+                LOGGER.info("Odometer restored: mileage={}, created={}", restored, created);
+            } else {
+                LOGGER.info("No existing odometer found, starting fresh");
+            }
+        } catch (Exception e) {
+            LOGGER.warn("Odometer restore failed, starting from 0: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Persists odometer to ACT_GE_PROPERTY using delete-then-insert strategy.
+     * Uses Camunda internal command API for writes (reads are public API).
+     */
+    private void persistOdometer(DelegateExecution execution, long currentMileage) {
+        try {
+            // Set created date on first persist
+            if (odometerCreated == null) {
+                odometerCreated = LocalDate.now().toString();
+            }
+
+            ProcessEngineConfigurationImpl config = (ProcessEngineConfigurationImpl)
+                execution.getProcessEngineServices().getProcessEngineConfiguration();
+
+            final String mileageValue = String.valueOf(currentMileage);
+            final String createdValue = odometerCreated;
+
+            config.getCommandExecutorTxRequired().execute(new Command<Void>() {
+                @Override
+                public Void execute(CommandContext commandContext) {
+                    // Delete existing entries (ignore if not present)
+                    try {
+                        PropertyEntity existing = commandContext.getPropertyManager()
+                            .findPropertyById(ODOMETER_MILEAGE_KEY);
+                        if (existing != null) {
+                            commandContext.getDbEntityManager().delete(existing);
+                        }
+                    } catch (Exception e) {
+                        // Ignore — may not exist yet
+                    }
+
+                    try {
+                        PropertyEntity existing = commandContext.getPropertyManager()
+                            .findPropertyById(ODOMETER_CREATED_KEY);
+                        if (existing != null) {
+                            commandContext.getDbEntityManager().delete(existing);
+                        }
+                    } catch (Exception e) {
+                        // Ignore — may not exist yet
+                    }
+
+                    // Insert fresh entries
+                    PropertyEntity mileageProp = new PropertyEntity(ODOMETER_MILEAGE_KEY, mileageValue);
+                    commandContext.getDbEntityManager().insert(mileageProp);
+
+                    PropertyEntity createdProp = new PropertyEntity(ODOMETER_CREATED_KEY, createdValue);
+                    commandContext.getDbEntityManager().insert(createdProp);
+
+                    return null;
+                }
+            });
+
+        } catch (Exception e) {
+            LOGGER.warn("Odometer persist failed (will retry at next interval): {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Logs the odometer reading in a formatted block.
+     */
+    private void logOdometer(long mileage) {
+        String formattedMileage = String.format("%,d", mileage);
+        LOGGER.info("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501");
+        LOGGER.info("\uD83D\uDE97 Catalyst Odometer");
+        LOGGER.info("   Created: {}", odometerCreated);
+        LOGGER.info("   Mileage: {}", formattedMileage);
+        LOGGER.info("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501");
     }
 }
