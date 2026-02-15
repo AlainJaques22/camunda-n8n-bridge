@@ -7,7 +7,7 @@
 
     <groupId>io.catalyst</groupId>
     <artifactId>camunda-n8n-bridge</artifactId>
-    <version>1.0.0</version>
+    <version>0.2.0</version>
     <packaging>jar</packaging>
 
     <name>Camunda n8n Bridge</name>
